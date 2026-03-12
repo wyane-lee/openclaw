@@ -1,44 +1,57 @@
-FROM node:20-slim
+# ============================================================
+# OpenClaw Docker 镜像
+# 
+# 构建: docker build -t openclaw .
+# 运行: docker run -d --name openclaw -v ~/.openclaw:/root/.openclaw openclaw
+# ============================================================
 
-WORKDIR /app
+FROM node:22-alpine
 
-# System deps: curl for CLI installs, git for agent tools, ca-certificates for HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+LABEL maintainer="OpenClaw Community"
+LABEL description="OpenClaw - Your Personal AI Assistant"
+LABEL version="1.0.0"
+
+# 安装基础依赖
+RUN apk add --no-cache \
+    bash \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    jq \
+    tzdata
 
-# Install npm dependencies first (best cache layer)
-COPY package*.json ./
-RUN npm install --production
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Install Claude Code CLI via npm (avoids OOM from native installer)
-RUN npm install -g @anthropic-ai/claude-code
+# 创建工作目录
+WORKDIR /app
 
-# Install Opencode CLI
-RUN curl -fsSL https://opencode.ai/install | bash
+# 安装 OpenClaw
+RUN npm install -g openclaw@latest
 
-COPY . .
+# 创建配置目录
+RUN mkdir -p /root/.openclaw/logs \
+    /root/.openclaw/data \
+    /root/.openclaw/skills \
+    /root/.openclaw/backups
 
-# Create non-root user (Claude Code refuses bypassPermissions as root)
-RUN useradd -m -s /bin/bash claw && chown -R claw:claw /app
+# 复制默认配置和技能
+COPY examples/config.example.yaml /root/.openclaw/config.yaml.example
+COPY examples/skills/ /root/.openclaw/skills/
 
-# Set up paths and workspace for the non-root user
-ENV PATH="/home/claw/.opencode/bin:/home/claw/.local/bin:${PATH}"
-ENV HOME=/home/claw
+# 设置卷挂载点
+VOLUME ["/root/.openclaw"]
 
-# Move opencode CLI to the new user's path
-RUN cp -r /root/.opencode /home/claw/.opencode 2>/dev/null || true && \
-    chown -R claw:claw /home/claw
+# 暴露端口
+EXPOSE 18789
 
-# Create workspace and Claude config as the non-root user
-USER claw
-RUN mkdir -p /home/claw/secure-openclaw/memory && \
-    mkdir -p /home/claw/.claude && \
-    echo '{}' > /home/claw/.claude/statsig_metadata.json && \
-    echo '{"hasCompletedOnboarding":true}' > /home/claw/.claude/settings.json
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD openclaw health || exit 1
 
-EXPOSE 4096
+# 入口脚本
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-CMD ["node", "gateway.js"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["openclaw", "start", "--daemon"]
