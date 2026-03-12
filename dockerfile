@@ -1,57 +1,91 @@
-# ============================================================
-# OpenClaw Docker 镜像
-# 
-# 构建: docker build -t openclaw .
-# 运行: docker run -d --name openclaw -v ~/.openclaw:/root/.openclaw openclaw
-# ============================================================
+# Build openclaw from source (some dist files are not shipped via npm).
+FROM node:22-bookworm AS openclaw-build
 
-FROM node:22-alpine
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    python3 \
+    make \
+    g++ \
+  && rm -rf /var/lib/apt/lists/*
 
-LABEL maintainer="OpenClaw Community"
-LABEL description="OpenClaw - Your Personal AI Assistant"
-LABEL version="1.0.0"
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
 
-# 安装基础依赖
-RUN apk add --no-cache \
-    bash \
+RUN corepack enable
+
+WORKDIR /openclaw
+
+ARG OPENCLAW_GIT_REF=main
+RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+
+# Patch: relax version requirements for packages using workspace protocol.
+RUN set -eux; \
+  find ./extensions -name 'package.json' -type f | while read -r f; do \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
+  done
+
+RUN pnpm install --no-frozen-lockfile
+RUN pnpm build
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:install && pnpm ui:build
+
+
+# Runtime image
+FROM node:22-bookworm
+
+ENV NODE_ENV=production
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     git \
-    jq \
-    tzdata
+    build-essential \
+    file \
+    procps \
+  && rm -rf /var/lib/apt/lists/*
 
-# 设置时区
-ENV TZ=Asia/Shanghai
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+# Install Linuxbrew (installer refuses to run as root, so use a temp user)
+RUN useradd -m -s /bin/bash linuxbrew \
+  && mkdir -p /home/linuxbrew/.linuxbrew \
+  && chown -R linuxbrew:linuxbrew /home/linuxbrew
+USER linuxbrew
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+USER root
+RUN chmod -R a+rx /home/linuxbrew/.linuxbrew
+ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew" \
+    HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar" \
+    HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew" \
+    PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 
-# 创建工作目录
-WORKDIR /app
+# Install Go (used by many skills)
+RUN curl -fsSL https://go.dev/dl/go1.24.1.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
 
-# 安装 OpenClaw
-RUN npm install -g openclaw@latest
+# Install uv (fast Python package manager, used by Python-based skills)
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
 
-# 创建配置目录
-RUN mkdir -p /root/.openclaw/logs \
-    /root/.openclaw/data \
-    /root/.openclaw/skills \
-    /root/.openclaw/backups
+# Ensure tool paths survive login-shell PATH reset (/etc/profile overwrites PATH)
+RUN printf '%s\n' \
+  'export PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/usr/local/go/bin:/root/.local/bin:$PATH"' \
+  > /etc/profile.d/custom-tools.sh \
+  && chmod +x /etc/profile.d/custom-tools.sh
 
-# 复制默认配置和技能
-COPY examples/config.example.yaml /root/.openclaw/config.yaml.example
-COPY examples/skills/ /root/.openclaw/skills/
+# Install under /opt/openclaw/app so that ../../ from dist/ lands at /opt/openclaw
+# which is where we place the symlinks. This avoids polluting / with project files.
+COPY --from=openclaw-build /openclaw /opt/openclaw/app
 
-# 设置卷挂载点
-VOLUME ["/root/.openclaw"]
+RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /opt/openclaw/app/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
+  && chmod +x /usr/local/bin/openclaw
 
-# 暴露端口
-EXPOSE 18789
-
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD openclaw health || exit 1
-
-# 入口脚本
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["openclaw", "start", "--daemon"]
+# Compiled JS in dist/ resolves ../../ relative to import.meta.url.
+# Files in /opt/openclaw/app/dist/ resolve ../../ to /opt/openclaw/.
+# Symlink docs/assets/package.json there so the paths work.
+RUN ln -s /opt/openclaw/app/docs /opt/openclaw/docs \
+  && ln -s /opt/openclaw/app/assets /opt/openclaw/assets \
+  && ln -s /opt/openclaw/app/package.json /opt/openclaw/package.json
