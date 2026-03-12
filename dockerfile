@@ -1,31 +1,44 @@
-ARG BASE_IMAGE=ghcr.io/coollabsio/openclaw-base:latest
+FROM node:20-slim
 
-FROM ${BASE_IMAGE}
+WORKDIR /app
 
-ENV NODE_ENV=production
+# System deps: curl for CLI installs, git for agent tools, ca-certificates for HTTPS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    nginx \
-    apache2-utils \
-  && rm -rf /var/lib/apt/lists/*
+# Install npm dependencies first (best cache layer)
+COPY package*.json ./
+RUN npm install --production
 
-# Remove default nginx site
-RUN rm -f /etc/nginx/sites-enabled/default
+# Install Claude Code CLI via npm (avoids OOM from native installer)
+RUN npm install -g @anthropic-ai/claude-code
 
-COPY scripts/ /app/scripts/
-RUN chmod +x /app/scripts/*.sh
+# Install Opencode CLI
+RUN curl -fsSL https://opencode.ai/install | bash
 
-ENV NPM_CONFIG_PREFIX="/data/npm-global" \
-    UV_TOOL_DIR="/data/uv/tools" \
-    UV_CACHE_DIR="/data/uv/cache" \
-    GOPATH="/data/go" \
-    PATH="/data/npm-global/bin:/data/uv/tools/bin:/data/go/bin:${PATH}"
+COPY . .
 
-ENV PORT=8080
-EXPOSE 8080
+# Create non-root user (Claude Code refuses bypassPermissions as root)
+RUN useradd -m -s /bin/bash claw && chown -R claw:claw /app
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
+# Set up paths and workspace for the non-root user
+ENV PATH="/home/claw/.opencode/bin:/home/claw/.local/bin:${PATH}"
+ENV HOME=/home/claw
 
-ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+# Move opencode CLI to the new user's path
+RUN cp -r /root/.opencode /home/claw/.opencode 2>/dev/null || true && \
+    chown -R claw:claw /home/claw
+
+# Create workspace and Claude config as the non-root user
+USER claw
+RUN mkdir -p /home/claw/secure-openclaw/memory && \
+    mkdir -p /home/claw/.claude && \
+    echo '{}' > /home/claw/.claude/statsig_metadata.json && \
+    echo '{"hasCompletedOnboarding":true}' > /home/claw/.claude/settings.json
+
+EXPOSE 4096
+
+CMD ["node", "gateway.js"]
