@@ -1,31 +1,26 @@
-ARG BASE_IMAGE=ghcr.io/coollabsio/openclaw-base:latest
+# Use a Node.js image suitable for the OpenClaw codebase
+FROM node:20-slim
 
-FROM ${BASE_IMAGE}
+# Install necessary runtime dependencies (e.g., Chromium)
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV NODE_ENV=production
+WORKDIR /app
 
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    nginx \
-    apache2-utils \
-  && rm -rf /var/lib/apt/lists/*
+# Copy application code
+COPY . .
 
-# Remove default nginx site
-RUN rm -f /etc/nginx/sites-enabled/default
+# Install dependencies
+RUN npm install
 
-COPY scripts/ /app/scripts/
-RUN chmod +x /app/scripts/*.sh
+# Build the application
+RUN npm run build
 
-ENV NPM_CONFIG_PREFIX="/data/npm-global" \
-    UV_TOOL_DIR="/data/uv/tools" \
-    UV_CACHE_DIR="/data/uv/cache" \
-    GOPATH="/data/go" \
-    PATH="/data/npm-global/bin:/data/uv/tools/bin:/data/go/bin:${PATH}"
-
-ENV PORT=8080
+# Expose the default OpenClaw port
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
-
-ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+# Run the application
+CMD ["npm", "start"]
