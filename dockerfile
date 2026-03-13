@@ -1,60 +1,31 @@
-# ---- Builder stage ----
-FROM node:20-slim AS builder
+ARG BASE_IMAGE=ghcr.io/coollabsio/openclaw-base:latest
 
-WORKDIR /app
+FROM ${BASE_IMAGE}
 
-# Install tini for proper PID 1 signal handling
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends tini && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install dependencies (leverage Docker layer caching)
-COPY package.json package-lock.json ./
-RUN npm ci
-
-# Copy source and build configuration
-COPY tsup.config.ts tsconfig.json ./
-COPY src/ src/
-
-# Build the project
-RUN npm run build
-
-# Prune dev dependencies for a lean production image
-RUN npm ci --omit=dev
-
-# ---- Runtime stage ----
-FROM node:20-slim AS runtime
-
-ARG VERSION=dev
-
-# OCI image labels
-LABEL org.opencontainers.image.title="openclaw-mcp" \
-      org.opencontainers.image.description="Model Context Protocol server for OpenClaw AI assistant integration" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.source="https://github.com/freema/openclaw-mcp" \
-      org.opencontainers.image.licenses="MIT"
-
-# Copy tini binary from builder
-COPY --from=builder /usr/bin/tini /usr/bin/tini
-
-WORKDIR /app
-
-# Copy only the production artifacts
-COPY --from=builder /app/dist/ dist/
-COPY --from=builder /app/node_modules/ node_modules/
-COPY --from=builder /app/package.json package.json
-
-# Environment defaults
 ENV NODE_ENV=production
-ENV OPENCLAW_URL=http://openclaw:18789
 
-# Run as non-root user
-RUN chown -R node:node /app
-USER node
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    nginx \
+    apache2-utils \
+  && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 3000
+# Remove default nginx site
+RUN rm -f /etc/nginx/sites-enabled/default
+
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
+
+ENV NPM_CONFIG_PREFIX="/data/npm-global" \
+    UV_TOOL_DIR="/data/uv/tools" \
+    UV_CACHE_DIR="/data/uv/cache" \
+    GOPATH="/data/go" \
+    PATH="/data/npm-global/bin:/data/uv/tools/bin:/data/go/bin:${PATH}"
+
+ENV PORT=8080
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)throw r.status}).then(()=>process.exit(0)).catch(()=>process.exit(1))"
+  CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
 
-ENTRYPOINT ["tini", "--", "node", "dist/index.js", "--transport", "sse"]
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
