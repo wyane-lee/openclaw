@@ -1,44 +1,60 @@
-FROM node:20-slim
+# ---- Builder stage ----
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
-# System deps: curl for CLI installs, git for agent tools, ca-certificates for HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# Install tini for proper PID 1 signal handling
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tini && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install npm dependencies first (best cache layer)
-COPY package*.json ./
-RUN npm install --production
+# Install dependencies (leverage Docker layer caching)
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Install Claude Code CLI via npm (avoids OOM from native installer)
-RUN npm install -g @anthropic-ai/claude-code
+# Copy source and build configuration
+COPY tsup.config.ts tsconfig.json ./
+COPY src/ src/
 
-# Install Opencode CLI
-RUN curl -fsSL https://opencode.ai/install | bash
+# Build the project
+RUN npm run build
 
-COPY . .
+# Prune dev dependencies for a lean production image
+RUN npm ci --omit=dev
 
-# Create non-root user (Claude Code refuses bypassPermissions as root)
-RUN useradd -m -s /bin/bash claw && chown -R claw:claw /app
+# ---- Runtime stage ----
+FROM node:20-slim AS runtime
 
-# Set up paths and workspace for the non-root user
-ENV PATH="/home/claw/.opencode/bin:/home/claw/.local/bin:${PATH}"
-ENV HOME=/home/claw
+ARG VERSION=dev
 
-# Move opencode CLI to the new user's path
-RUN cp -r /root/.opencode /home/claw/.opencode 2>/dev/null || true && \
-    chown -R claw:claw /home/claw
+# OCI image labels
+LABEL org.opencontainers.image.title="openclaw-mcp" \
+      org.opencontainers.image.description="Model Context Protocol server for OpenClaw AI assistant integration" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/freema/openclaw-mcp" \
+      org.opencontainers.image.licenses="MIT"
 
-# Create workspace and Claude config as the non-root user
-USER claw
-RUN mkdir -p /home/claw/secure-openclaw/memory && \
-    mkdir -p /home/claw/.claude && \
-    echo '{}' > /home/claw/.claude/statsig_metadata.json && \
-    echo '{"hasCompletedOnboarding":true}' > /home/claw/.claude/settings.json
+# Copy tini binary from builder
+COPY --from=builder /usr/bin/tini /usr/bin/tini
 
-EXPOSE 4096
+WORKDIR /app
 
-CMD ["node", "gateway.js"]
+# Copy only the production artifacts
+COPY --from=builder /app/dist/ dist/
+COPY --from=builder /app/node_modules/ node_modules/
+COPY --from=builder /app/package.json package.json
+
+# Environment defaults
+ENV NODE_ENV=production
+ENV OPENCLAW_URL=http://openclaw:18789
+
+# Run as non-root user
+RUN chown -R node:node /app
+USER node
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)throw r.status}).then(()=>process.exit(0)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["tini", "--", "node", "dist/index.js", "--transport", "sse"]
